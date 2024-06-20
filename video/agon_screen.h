@@ -96,7 +96,7 @@ bool updateVGAController(uint8_t colours) {
 // - 1: Invalid # of colours
 // - 2: Not enough memory for mode
 //
-int8_t change_resolution(uint8_t colours, char * modeLine, bool doubleBuffered = false) {
+int8_t change_resolution(uint8_t colours, const char * modeLine, bool doubleBuffered = false) {
 	if (!updateVGAController(colours)) {			// If we can't update the controller then
 		return 1;									// Return the error
 	}
@@ -131,18 +131,25 @@ inline bool isDoubleBuffered() {
 	return _VGAController->isDoubleBuffered();
 }
 
-// Swap to other buffer if we're in a double-buffered mode
-//
-void switchBuffer() {
-	if (isDoubleBuffered()) {
-		canvas->swapBuffers();
-	}
-}
-
 // Wait for plot completion
 //
 inline void waitPlotCompletion(bool waitForVSync = false) {
 	canvas->waitCompletion(waitForVSync);
+}
+
+// Swap to other buffer if we're in a double-buffered mode
+// Always waits for VSYNC
+//
+void switchBuffer() {
+	if (isDoubleBuffered()) {
+		canvas->swapBuffers();
+	} else {
+		waitPlotCompletion(true);
+	}
+}
+
+void setMouseCursorPos(uint16_t x, uint16_t y) {
+	_VGAController->setMouseCursorPos(x, y);
 }
 
 #endif // AGON_SCREEN_H

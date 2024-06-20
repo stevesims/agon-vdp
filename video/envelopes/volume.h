@@ -9,9 +9,10 @@
 
 class VolumeEnvelope {
 	public:
-		virtual uint8_t getVolume(uint8_t baseVolume, uint32_t elapsed, int32_t duration);
-		virtual bool isReleasing(uint32_t elapsed, int32_t duration);
-		virtual bool isFinished(uint32_t elapsed, int32_t duration);
+		virtual uint8_t getVolume(uint8_t baseVolume, uint32_t elapsed, int32_t duration) = 0;
+		virtual bool isReleasing(uint32_t elapsed, int32_t duration) = 0;
+		virtual bool isFinished(uint32_t elapsed, int32_t duration) = 0;
+		virtual uint16_t getRelease() = 0;
 };
 
 class ADSRVolumeEnvelope : public VolumeEnvelope {
@@ -20,6 +21,9 @@ class ADSRVolumeEnvelope : public VolumeEnvelope {
 		uint8_t getVolume(uint8_t baseVolume, uint32_t elapsed, int32_t duration);
 		bool isReleasing(uint32_t elapsed, int32_t duration);
 		bool isFinished(uint32_t elapsed, int32_t duration);
+		uint16_t getRelease() {
+			return this->_release;
+		}
 	private:
 		uint16_t _attack;
 		uint16_t _decay;
@@ -51,7 +55,7 @@ uint8_t ADSRVolumeEnvelope::getVolume(uint8_t baseVolume, uint32_t elapsed, int3
 		return map(phaseTime, 0, this->_decay, baseVolume, sustainVolume);
 	}
 	phaseTime -= this->_decay;
-	auto sustainDuration = duration < 0 ? elapsed : duration - (this->_attack + this->_decay);
+	int32_t sustainDuration = duration < 0 ? elapsed : duration - (this->_attack + this->_decay);
 	if (sustainDuration < 0) sustainDuration = 0;
 	if (phaseTime < sustainDuration) {
 		return sustainVolume;

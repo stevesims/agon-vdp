@@ -44,21 +44,9 @@ void setActiveViewport(uint8_t type) {
 	activeViewport = getViewport(type);
 }
 
-// Translate a point relative to the graphics viewport
-//
-Point translateViewport(uint16_t X, uint16_t Y) {
-	if (logicalCoords) {
-		return Point(graphicsViewport.X1 + (origin.X + X), graphicsViewport.Y2 - (origin.Y + Y));
-	}
-	return Point(graphicsViewport.X1 + (origin.X + X), graphicsViewport.Y1 + (origin.Y + Y));
-}
-Point translateViewport(Point p) {
-	return translateViewport(p.X, p.Y);
-}
-
 // Scale a point
 //
-Point scale(uint16_t X, uint16_t Y) {
+Point scale(int16_t X, int16_t Y) {
 	if (logicalCoords) {
 		return Point((double)X / logicalScaleX, (double)Y / logicalScaleY);
 	}
@@ -68,9 +56,20 @@ Point scale(Point p) {
 	return scale(p.X, p.Y);
 }
 
+// Convert to currently active coordinate system
+//
+Point toCurrentCoordinates(int16_t X, int16_t Y) {
+	// if we're using logical coordinates then we need to scale and invert the Y axis
+	if (logicalCoords) {
+		return Point(X * logicalScaleX, ((canvasH - 1) - Y) * logicalScaleY);
+	}
+
+	return Point(X, Y);
+}
+
 // Translate a point relative to the canvas
 //
-Point translateCanvas(uint16_t X, uint16_t Y) {
+Point translateCanvas(int16_t X, int16_t Y) {
 	if (logicalCoords) {
 		return Point(origin.X + X, (canvasH - 1) - (origin.Y + Y));
 	}
@@ -99,7 +98,7 @@ bool setTextViewport(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2) {
 	if (x2 >= canvasW) x2 = canvasW - 1;
 	if (y2 >= canvasH) y2 = canvasH - 1;
 
-	if (x1 >= 0 && y1 >= 0 && x2 > x1 && y2 > y1) {
+	if (x2 > x1 && y2 > y1) {
 		textViewport = Rect(x1, y1, x2, y2);
 		useViewports = true;
 		return true;

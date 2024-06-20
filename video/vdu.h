@@ -10,6 +10,15 @@
 // Handle VDU commands
 //
 void VDUStreamProcessor::vdu(uint8_t c) {
+
+	// We want to send raw chars back to the debugger
+	// this allows binary (faster) data transfer in ZDI mode
+	// to inspect memory and register values
+	//
+	if(consoleMode) {
+		DBGSerial.write (c);
+	}
+	
 	switch(c) {
 		case 0x04:	
 			// enable text cursor
@@ -82,6 +91,7 @@ void VDUStreamProcessor::vdu(uint8_t c) {
 			break;
 		case 0x1D:	// VDU_29
 			vdu_origin();
+			break;
 		case 0x1E:	// Move cursor to top left of the viewport
 			cursorHome();
 			break;
@@ -135,6 +145,9 @@ void VDUStreamProcessor::vdu_mode() {
 	if (mode >= 0) {
 	  	set_mode(mode);
 		sendModeInformation();
+		if (mouseEnabled) {
+			sendMouseData();
+		}
 	}
 }
 
@@ -157,38 +170,121 @@ void VDUStreamProcessor::vdu_graphicsViewport() {
 // VDU 25 Handle PLOT
 //
 void VDUStreamProcessor::vdu_plot() {
-	auto mode = readByte_t(); if (mode == -1) return;
+	auto command = readByte_t(); if (command == -1) return;
+	auto mode = command & 0x07;
+	auto operation = command & 0xF8;
 
 	auto x = readWord_t(); if (x == -1) return; else x = (short)x;
 	auto y = readWord_t(); if (y == -1) return; else y = (short)y;
+	if (ttxtMode) return;
 
-	pushPoint(x, y);
-	setGraphicsOptions();
+	if (mode < 4) {
+		pushPointRelative(x, y);
+	} else {
+		pushPoint(x, y);
+	}
+	setGraphicsOptions(mode);
 
-	debug_log("vdu_plot: mode %d, (%d,%d) -> (%d,%d)\n\r", mode, x, y, p1.X, p1.Y);
-  	switch (mode) {
-		case 0x04: 			// Move
+	// make copy/move work for mode 2 and 6
+	if (operation == 0xB8 && (mode == 2 || mode == 6)) {
+		mode = 3;
+	}
+
+	debug_log("vdu_plot: operation: %X, mode %d, (%d,%d) -> (%d,%d)\n\r", operation, mode, x, y, p1.X, p1.Y);
+
+	switch (mode) {
+		case 0:
+		case 4:
+			// move to modes
 			moveTo();
 			break;
-		case 0x05: 			// Line
-			plotLine();
+		case 2:
+		case 6:
+			// draw inverse logical colour not supported
+			debug_log("plot inverse logical colour not implemented\n\r");
 			break;
-		case 0x40 ... 0x47:	// Point
-			plotPoint();
-			break;
-		case 0x50 ... 0x57: // Triangle
-			plotTriangle(mode - 0x50);
-			break;
-		case 0x90 ... 0x97: // Circle
-			plotCircle(mode - 0x90);
+		default:
+			// 1, 3, 5, 7 are all draw modes
+			switch (operation) {
+				case 0x00: 	// line
+					plotLine();
+					break;
+				case 0x08:	// line, omitting last point
+					plotLine(false, true);
+					break;
+				case 0x10:	// dot-dash line
+				case 0x18:	// dot-dash line, omitting last point
+				case 0x30:	// dot-dash line, omitting first, pattern continued
+				case 0x38:	// dot-dash line, omitting both, pattern continued
+					debug_log("plot dot-dash line not implemented\n\r");
+					break;
+				case 0x20: 	// solid line, first point omitted
+					plotLine(true, false);
+					break;
+				case 0x28:	// solid line, first and last points omitted
+					plotLine(true, true);
+					break;
+				case 0x40:	// point
+					plotPoint();
+					break;
+				case 0x48:	// line fill left/right to non-bg
+				case 0x58:	// line fill right to bg
+				case 0x68:	// line fill left/left to fg
+				case 0x78:	// line fill right to non-fg
+					debug_log("plot line with fill left and/or right not implemented\n\r");
+					break;
+				case 0x50:	// triangle fill
+					setGraphicsFill(mode);
+					plotTriangle();
+					break;
+				case 0x60:	// rectangle fill
+					setGraphicsFill(mode);
+					plotRectangle();
+					break;
+				case 0x70:	// parallelogram fill
+					setGraphicsFill(mode);
+					plotParallelogram();
+					break;
+				case 0x80:	// flood to non-bg
+				case 0x88:	// flood to fg
+					debug_log("plot flood fill not implemented\n\r");
+					break;
+				case 0x90:	// circle outline
+					plotCircle();
+					break;
+				case 0x98:	// circle fill
+					setGraphicsFill(mode);
+					plotCircle(true);
+					break;
+				case 0xA0:	// circular arc
+				case 0xA8:	// circular segment
+				case 0xB0:	// circular sector
+					// fab-gl has no arc or segment operations, only simple ellipse (squashable circle)
+					debug_log("plot circular arc/segment/sector not implemented\n\r");
+					break;
+				case 0xB8:	// copy/move
+					plotCopyMove(mode);
+					break;
+				case 0xC0:	// ellipse outline
+				case 0xC8:	// ellipse fill
+					// fab-gl's ellipse isn't compatible with BBC BASIC
+					debug_log("plot ellipse not implemented\n\r");
+					break;
+				case 0xE8:	// Bitmap plot
+					plotBitmap();
+					break;
+			}
+			moveTo();
 			break;
 	}
-	waitPlotCompletion();
 }
 
 // VDU 26 Reset graphics and text viewports
 //
 void VDUStreamProcessor::vdu_resetViewports() {
+	if (ttxtMode) {
+		ttxt_instance.set_window(0,24,39,0);
+	}
 	viewportReset();
 	// reset cursors too (according to BBC BASIC manual)
 	cursorHome();
@@ -200,11 +296,21 @@ void VDUStreamProcessor::vdu_resetViewports() {
 // Example: VDU 28,20,23,34,4
 //
 void VDUStreamProcessor::vdu_textViewport() {
-	auto x1 = readByte_t() * fontW;				// Left
-	auto y2 = (readByte_t() + 1) * fontH - 1;	// Bottom
-	auto x2 = (readByte_t() + 1) * fontW - 1;	// Right
-	auto y1 = readByte_t() * fontH;				// Top
+	auto cx1 = readByte_t();
+	auto cy2 = readByte_t();
+	auto cx2 = readByte_t();
+	auto cy1 = readByte_t();
+	auto x1 = cx1 * fontW;				// Left
+	auto y2 = (cy2 + 1) * fontH - 1;	// Bottom
+	auto x2 = (cx2 + 1) * fontW - 1;	// Right
+	auto y1 = cy1 * fontH;				// Top
 
+	if (ttxtMode) {
+		if (cx2 > 39) cx2 = 39;
+		if (cy2 > 24) cy2 = 24;
+		if (cx2 >= cx1 && cy2 >= cy1)
+	    ttxt_instance.set_window(cx1,cy2,cx2,cy1);
+	}	
 	if (setTextViewport(x1, y1, x2, y2)) {
 		ensureCursorInViewport(textViewport);
 		debug_log("vdu_textViewport: OK %d,%d,%d,%d\n\r", x1, y1, x2, y2);

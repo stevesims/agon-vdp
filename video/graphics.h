@@ -4,6 +4,7 @@
 #include <fabgl.h>
 
 #include "agon.h"
+#include "agon_ps2.h"
 #include "agon_screen.h"
 #include "agon_fonts.h"							// The Acorn BBC Micro Font
 #include "agon_palette.h"						// Colour lookup table
@@ -15,12 +16,14 @@ fabgl::PaintOptions			gpo;				// Graphics paint options
 fabgl::PaintOptions			tpo;				// Text paint options
 
 Point			p1, p2, p3;						// Coordinate store for plot
+Point			rp1, rp2, rp3;					// Relative coordinates store for plot
 RGB888			gfg, gbg;						// Graphics foreground and background colour
 RGB888			tfg, tbg;						// Text foreground and background colour
 uint8_t			fontW;							// Font width
 uint8_t			fontH;							// Font height
 uint8_t			videoMode;						// Current video mode
 bool			legacyModes = false;			// Default legacy modes being false
+bool			rectangularPixels = false;		// Pixels are square by default
 uint8_t			palette[64];					// Storage for the palette
 
 
@@ -57,28 +60,31 @@ char getScreenChar(uint16_t px, uint16_t py) {
 
 	// Do some bounds checking first
 	//
-	if (px < 0 || py < 0 || px >= canvasW - 8 || py >= canvasH - 8) {
+	if (px >= canvasW - 8 || py >= canvasH - 8) {
 		return 0;
 	}
-
-	// Now scan the screen and get the 8 byte pixel representation in charData
-	//
-	for (uint8_t y = 0; y < 8; y++) {
-		charRow = 0;
-		for (uint8_t x = 0; x < 8; x++) {
-			pixel = canvas->getPixel(px + x, py + y);
-			if (!(pixel.R == R && pixel.G == G && pixel.B == B)) {
-				charRow |= (0x80 >> x);
-			}
+	if (ttxtMode) {
+		return ttxt_instance.get_screen_char(px,py);
+	} else {
+		// Now scan the screen and get the 8 byte pixel representation in charData
+		//
+		for (uint8_t y = 0; y < 8; y++) {
+	    	charRow = 0;
+	    	for (uint8_t x = 0; x < 8; x++) {
+	      		pixel = canvas->getPixel(px + x, py + y);
+	      		if (!(pixel.R == R && pixel.G == G && pixel.B == B)) {
+					charRow |= (0x80 >> x);
+	    		}
+	    	}
+	    	charData[y] = charRow;
 		}
-		charData[y] = charRow;
-	}
-	//
-	// Finally try and match with the character set array
-	//
-	for (uint8_t i = 32; i <= 255; i++) {
-		if (cmpChar(charData, &fabgl::FONT_AGON_DATA[i * 8], 8)) {	
-			return i;		
+		//
+		// Finally try and match with the character set array
+		//
+		for (auto i = 32; i <= 255; i++) {
+	    	if (cmpChar(charData, &fabgl::FONT_AGON_DATA[i * 8], 8)) {	
+	    		return i;		
+			}
 		}
 	}
 	return 0;
@@ -87,7 +93,7 @@ char getScreenChar(uint16_t px, uint16_t py) {
 // Get pixel value at screen coordinates
 //
 RGB888 getPixel(uint16_t x, uint16_t y) {
-	Point p = translateViewport(scale(x, y));
+	Point p = translateCanvas(scale(x, y));
 	if (p.X >= 0 && p.Y >= 0 && p.X < canvasW && p.Y < canvasH) {
 		return canvas->getPixel(p.X, p.Y);
 	}
@@ -126,7 +132,6 @@ void setPalette(uint8_t l, uint8_t p, uint8_t r, uint8_t g, uint8_t b) {
 			return;
 		}
 		setPaletteItem(l, col);
-		waitPlotCompletion();
 		debug_log("vdu_palette: %d,%d,%d,%d,%d\n\r", l, p, r, g, b);
 	} else {
 		debug_log("vdu_palette: not supported in this mode\n\r");
@@ -139,6 +144,7 @@ void setPalette(uint8_t l, uint8_t p, uint8_t r, uint8_t g, uint8_t b) {
 // - sizeOfArray: Size of passed colours array
 //
 void resetPalette(const uint8_t colours[]) {
+	if (ttxtMode) return;
 	for (uint8_t i = 0; i < 64; i++) {
 		uint8_t c = colours[i % getVGAColourDepth()];
 		palette[i] = c;
@@ -162,9 +168,11 @@ fabgl::PaintOptions getPaintOptions(uint8_t mode, fabgl::PaintOptions priorPaint
 // Set text colour (handles COLOUR / VDU 17)
 //
 void setTextColour(uint8_t colour) {
+	if (ttxtMode) return;
+
 	uint8_t c = palette[colour % getVGAColourDepth()];
 
-	if (colour >= 0 && colour < 64) {
+	if (colour < 64) {
 		tfg = colourLookup[c];
 		debug_log("vdu_colour: tfg %d = %02X : %02X,%02X,%02X\n\r", colour, c, tfg.R, tfg.G, tfg.B);
 	}
@@ -180,10 +188,12 @@ void setTextColour(uint8_t colour) {
 // Set graphics colour (handles GCOL / VDU 18)
 //
 void setGraphicsColour(uint8_t mode, uint8_t colour) {
+	if (ttxtMode) return;
+	
 	uint8_t c = palette[colour % getVGAColourDepth()];
 
-	if (mode >= 0 && mode <= 6) {
-		if (colour >= 0 && colour < 64) {
+	if (mode <= 6) {
+		if (colour < 64) {
 			gfg = colourLookup[c];
 			debug_log("vdu_gcol: mode %d, gfg %d = %02X : %02X,%02X,%02X\n\r", mode, colour, c, gfg.R, gfg.G, gfg.B);
 		}
@@ -204,13 +214,17 @@ void setGraphicsColour(uint8_t mode, uint8_t colour) {
 // Clear a viewport
 //
 void clearViewport(Rect * viewport) {
-	if (canvas) {
-		if (useViewports) {
-			canvas->fillRectangle(*viewport);
-		}
-		else {
-			canvas->clear();
-		}
+	if (ttxtMode) {
+		ttxt_instance.cls();
+	} else {       
+  		if (canvas) {
+	  		if (useViewports) {
+		  		canvas->fillRectangle(*viewport);
+		  	}
+		  	else {
+			  canvas->clear();
+			}
+	  	}
 	}
 }
 
@@ -219,12 +233,19 @@ void clearViewport(Rect * viewport) {
 // Push point to list
 //
 void pushPoint(Point p) {
+	rp3 = rp2;
+	rp2 = rp1;
+	rp1 = Point(p.X - p1.X, p.Y - p1.Y);
 	p3 = p2;
 	p2 = p1;
 	p1 = p;
 }
 void pushPoint(uint16_t x, uint16_t y) {
-	pushPoint(translateViewport(scale(x, y)));
+	pushPoint(translateCanvas(scale(x, y)));
+}
+void pushPointRelative(int16_t x, int16_t y) {
+	auto scaledPoint = scale(x, y);
+	pushPoint(Point(p1.X + scaledPoint.X, p1.Y + (logicalCoords ? -scaledPoint.Y : scaledPoint.Y)));
 }
 
 // get graphics cursor
@@ -235,10 +256,40 @@ Point * getGraphicsCursor() {
 
 // Set up canvas for drawing graphics
 //
-void setGraphicsOptions() {
+void setGraphicsOptions(uint8_t mode) {
+	auto colourMode = mode & 0x03;
 	canvas->setClippingRect(graphicsViewport);
-	canvas->setPenColor(gfg);
+	switch (colourMode) {
+		case 0: break;	// move command
+		case 1: {
+			// use fg colour
+			canvas->setPenColor(gfg);
+		} break;
+		case 2: break;	// logical inverse colour (not suported)
+		case 3: {
+			// use bg colour
+			canvas->setPenColor(gbg);
+		} break;
+	}
 	canvas->setPaintOptions(gpo);
+}
+
+// Set up canvas for drawing filled graphics
+//
+void setGraphicsFill(uint8_t mode) {
+	auto colourMode = mode & 0x03;
+	switch (colourMode) {
+		case 0: break;	// move command
+		case 1: {
+			// use fg colour
+			canvas->setBrushColor(gfg);
+		} break;
+		case 2: break;	// logical inverse colour (not suported)
+		case 3: {
+			// use bg colour
+			canvas->setBrushColor(gbg);
+		} break;
+	}
 }
 
 // Move to
@@ -249,8 +300,22 @@ void moveTo() {
 
 // Line plot
 //
-void plotLine() {
+void plotLine(bool omitFirstPoint = false, bool omitLastPoint = false) {
+	RGB888 firstPixelColour;
+	RGB888 lastPixelColour;
+	if (omitFirstPoint) {
+		firstPixelColour = canvas->getPixel(p2.X, p2.Y);
+	}
+	if (omitLastPoint) {
+		lastPixelColour = canvas->getPixel(p1.X, p1.Y);
+	}
 	canvas->lineTo(p1.X, p1.Y);
+	if (omitFirstPoint) {
+		canvas->setPixel(p2, firstPixelColour);
+	}
+	if (omitLastPoint) {
+		canvas->setPixel(p1, lastPixelColour);
+	}
 }
 
 // Point point
@@ -261,49 +326,124 @@ void plotPoint() {
 
 // Triangle plot
 //
-void plotTriangle(uint8_t mode) {
+void plotTriangle() {
 	Point p[3] = {
 		p3,
 		p2,
 		p1, 
 	};
-	canvas->setBrushColor(gfg);
+	canvas->drawPath(p, 3);
 	canvas->fillPath(p, 3);
-	canvas->setBrushColor(tbg);
+}
+
+// Rectangle plot
+//
+void plotRectangle() {
+	canvas->fillRectangle(p2.X, p2.Y, p1.X, p1.Y);
+}
+
+// Parallelogram plot
+//
+void plotParallelogram() {
+	Point p[4] = {
+		p3,
+		p2,
+		p1,
+		Point(p1.X + (p3.X - p2.X), p1.Y + (p3.Y - p2.Y)),
+	};
+	canvas->drawPath(p, 4);
+	canvas->fillPath(p, 4);
 }
 
 // Circle plot
 //
-void plotCircle(uint8_t mode) {
-	switch (mode) {
-		case 0x00 ... 0x03: { // Circle
-			auto r = 2 * (p1.X + p1.Y);
-			canvas->drawEllipse(p2.X, p2.Y, r, r);
-		} break;
-		case 0x04 ... 0x07: { // Circle
-			auto a = p2.X - p1.X;
-			auto b = p2.Y - p1.Y;
-			auto r = 2 * sqrt(a * a + b * b);
-			canvas->drawEllipse(p2.X, p2.Y, r, r);
-		} break;
+void plotCircle(bool filled = false) {
+	auto size = 2 * sqrt(rp1.X * rp1.X + (rp1.Y * rp1.Y * (rectangularPixels ? 4 : 1)));
+	if (filled) {
+		canvas->fillEllipse(p2.X, p2.Y, size, rectangularPixels ? size / 2 : size);
+	} else {
+		canvas->drawEllipse(p2.X, p2.Y, size, rectangularPixels ? size / 2 : size);
 	}
+}
+
+// Copy or move a rectangle
+//
+void plotCopyMove(uint8_t mode) {
+	uint16_t x = p1.X;
+	uint16_t y = p1.Y;
+	uint16_t width = abs(p3.X - p2.X) + 1;
+	uint16_t height = abs(p3.Y - p2.Y) + 1;
+	uint16_t sourceX = p3.X < p2.X ? p3.X : p2.X;
+	uint16_t sourceY = p3.Y < p2.Y ? p3.Y : p2.Y;
+
+	debug_log("plotCopyMove: mode %d, (%d,%d) -> (%d,%d), width: %d, height: %d\n\r", mode, sourceX, sourceY, x, y, width, height);
+	canvas->copyRect(sourceX, sourceY, x, y - height, width, height);
+	if (mode == 1 || mode == 5) {
+		// move rectangle needs to clear source rectangle
+		// being careful not to clear the destination rectangle
+		canvas->setBrushColor(gbg);
+		Rect sourceRect = Rect(sourceX, sourceY, sourceX + width, sourceY + height);
+		Rect destRect = Rect(x, y - height, x + width, y);
+		if (sourceRect.intersects(destRect)) {
+			// we can use clipping rects to block out parts of the screen
+			// the areas above, below, left, and right of the destination rectangle
+			// and then draw rectangles over our source rectangle
+			auto intersection = sourceRect.intersection(destRect);
+
+			if (intersection.X1 > sourceRect.X1) {
+				// fill in source area to the left of destination
+				debug_log("clearing left of destination\n\r");
+				canvas->setClippingRect(Rect(sourceRect.X1, sourceRect.Y1, intersection.X1 - 1, sourceRect.Y2));
+				canvas->fillRectangle(sourceRect);
+			}
+			if (intersection.X2 < sourceRect.X2) {
+				// fill in source area to the right of destination
+				debug_log("clearing right of destination\n\r");
+				canvas->setClippingRect(Rect(intersection.X2, sourceRect.Y1, sourceRect.X2, sourceRect.Y2));
+				canvas->fillRectangle(sourceRect);
+			}
+			if (intersection.Y1 > sourceRect.Y1) {
+				// fill in source area above destination
+				debug_log("clearing above destination\n\r");
+				canvas->setClippingRect(Rect(sourceRect.X1, sourceRect.Y1, sourceRect.X2, intersection.Y1 - 1));
+				canvas->fillRectangle(sourceRect);
+			}
+			if (intersection.Y2 < sourceRect.Y2) {
+				// fill in source area below destination
+				debug_log("clearing below destination\n\r");
+				canvas->setClippingRect(Rect(sourceRect.X1, intersection.Y2, sourceRect.X2, sourceRect.Y2));
+				canvas->fillRectangle(sourceRect);
+			}
+		} else {
+			canvas->fillRectangle(sourceRect);
+		}
+	}
+}
+
+// Plot bitmap
+//
+void plotBitmap() {
+	drawBitmap(p1.X, p1.Y);
 }
 
 // Character plot
 //
 void plotCharacter(char c) {
-	if (textCursorActive()) {
-		canvas->setClippingRect(defaultViewport);
-		canvas->setPenColor(tfg);
-		canvas->setBrushColor(tbg);
-		canvas->setPaintOptions(tpo);
-	}
-	else {
-		canvas->setClippingRect(graphicsViewport);
-		canvas->setPenColor(gfg);
-		canvas->setPaintOptions(gpo);
-	}
-	canvas->drawChar(activeCursor->X, activeCursor->Y, c);
+	if (ttxtMode) {
+    	ttxt_instance.draw_char(activeCursor->X, activeCursor->Y, c);
+  	} else {
+  		if (textCursorActive()) {
+	  		canvas->setClippingRect(defaultViewport);
+			canvas->setPenColor(tfg);
+			canvas->setBrushColor(tbg);
+			canvas->setPaintOptions(tpo);
+	  	} else {
+		  canvas->setClippingRect(graphicsViewport);
+		  canvas->setPenColor(gfg);
+		  canvas->setPaintOptions(gpo);
+		}
+		canvas->drawChar(activeCursor->X, activeCursor->Y, c);
+  	}
 	cursorRight();
 }
 
@@ -311,8 +451,12 @@ void plotCharacter(char c) {
 //
 void plotBackspace() {
 	cursorLeft();
-	canvas->setBrushColor(textCursorActive() ? tbg : gbg);
-	canvas->fillRectangle(activeCursor->X, activeCursor->Y, activeCursor->X + fontW - 1, activeCursor->Y + fontH - 1);
+	if (ttxtMode) {
+		ttxt_instance.draw_char(activeCursor->X, activeCursor->Y, ' ');
+	} else {
+		canvas->setBrushColor(textCursorActive() ? tbg : gbg);
+		canvas->fillRectangle(activeCursor->X, activeCursor->Y, activeCursor->X + fontW - 1, activeCursor->Y + fontH - 1);
+	}
 }
 
 // Set character overwrite mode (background fill)
@@ -338,6 +482,9 @@ void drawCursor(Point p) {
 // 
 void cls(bool resetViewports) {
 	if (resetViewports) {
+    	if (ttxtMode) {
+    		ttxt_instance.set_window(0,24,39,0);
+		}
 		viewportReset();
 	}
 	if (canvas) {
@@ -379,6 +526,7 @@ int8_t change_mode(uint8_t mode) {
 	int8_t errVal = -1;
 
 	cls(true);
+	ttxtMode = false;
 	switch (mode) {
 		case 0:
 			if (legacyModes == true) {
@@ -417,6 +565,13 @@ int8_t change_mode(uint8_t mode) {
 		case 6:
 			errVal = change_resolution(2, VGA_640x240_60Hz);
 			break;
+		case 7:
+	    	errVal = change_resolution(16, VGA_640x480_60Hz);
+	    	if (errVal == 0) {
+	      		errVal = ttxt_instance.init();
+	    		if (errVal == 0) ttxtMode = true; 
+	    	}
+	    	break;
 		case 8:
 			errVal = change_resolution(64, QVGA_320x240_60Hz);		// VGA "Mode X"
 			break;
@@ -506,23 +661,30 @@ int8_t change_mode(uint8_t mode) {
 	gbg = colourLookup[0x00];
 	tfg = colourLookup[0x3F];
 	tbg = colourLookup[0x00];
-	canvas->selectFont(&fabgl::FONT_AGON);
+	if (!ttxtMode) {
+		canvas->selectFont(&fabgl::FONT_AGON);
+	}
 	setCharacterOverwrite(true);
 	canvas->setPenWidth(1);
+	setCanvasWH(canvas->getWidth(), canvas->getHeight());
+	// simple heuristic to determine rectangular pixels
+	rectangularPixels = ((float)canvasW / (float)canvasH) > 2;
+	fontW = canvas->getFontInfo()->width;
+	fontH = canvas->getFontInfo()->height;
+	viewportReset();
 	setOrigin(0,0);
 	pushPoint(0,0);
 	pushPoint(0,0);
 	pushPoint(0,0);
-	setCanvasWH(canvas->getWidth(), canvas->getHeight());
-	fontW = canvas->getFontInfo()->width;
-	fontH = canvas->getFontInfo()->height;
-	viewportReset();
+	moveTo();
 	resetCursor();
 	homeCursor();
 	if (isDoubleBuffered()) {
 		switchBuffer();
 		cls(false);
 	}
+	resetMousePositioner(canvasW, canvasH, _VGAController.get());
+	setMouseCursor();
 	debug_log("do_modeChange: canvas(%d,%d), scale(%f,%f), mode %d, videoMode %d\n\r", canvasW, canvasH, logicalScaleX, logicalScaleY, mode, videoMode);
 	return 0;
 }
@@ -553,22 +715,24 @@ void setLegacyModes(bool legacy) {
 
 void scrollRegion(Rect * region, uint8_t direction, int16_t movement) {
 	canvas->setScrollingRegion(region->X1, region->Y1, region->X2, region->Y2);
-
-	switch (direction) {
-		case 0:	// Right
-			canvas->scroll(movement, 0);
-			break;
-		case 1: // Left
-			canvas->scroll(-movement, 0);
-			break;
-		case 2: // Down
-			canvas->scroll(0, movement);
-			break;
-		case 3: // Up
-			canvas->scroll(0, -movement);
-			break;
-	}
-	waitPlotCompletion();
+	if (ttxtMode) {
+    	if (direction == 3) ttxt_instance.scroll();
+  	} else {
+		switch (direction) {
+			case 0:	// Right
+				canvas->scroll(movement, 0);
+		  		break;
+			case 1: // Left
+				canvas->scroll(-movement, 0);
+				break;
+			case 2: // Down
+				canvas->scroll(0, movement);
+				break;
+			case 3: // Up
+				canvas->scroll(0, -movement);
+				break;
+  		}
+  	} 
 }
 
 #endif

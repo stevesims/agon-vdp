@@ -1,24 +1,49 @@
 #ifndef VDU_SYS_H
 #define VDU_SYS_H
 
+#include <vector>
+
 #include <fabgl.h>
 #include <ESP32Time.h>
 
 #include "agon.h"
-#include "agon_keyboard.h"
+#include "agon_ps2.h"
 #include "cursor.h"
 #include "graphics.h"
 #include "vdu_audio.h"
+#include "vdu_buffered.h"
 #include "vdu_sprites.h"
+#include "updater.h"
 
 extern void switchTerminalMode();				// Switch to terminal mode
+extern void setConsoleMode(bool mode);			// Set console mode
 
 bool			initialised = false;			// Is the system initialised yet?
 ESP32Time		rtc(0);							// The RTC
 
+// Buffer for serialised time
+//
+typedef union {
+	struct {
+		uint32_t month : 4;
+		uint32_t day : 5;
+		uint32_t dayOfWeek : 3;
+		uint32_t dayOfYear : 9;
+		uint32_t hour : 5;
+		uint32_t minute : 6;
+		uint8_t  second;
+		uint8_t  year;
+	};
+	uint8_t packet[6];
+} vdp_time_t;
+
 // Wait for eZ80 to initialise
 //
 void VDUStreamProcessor::wait_eZ80() {
+	if(esp_reset_reason() == ESP_RST_SW) {
+		return;
+	}
+
 	debug_log("wait_eZ80: Start\n\r");
 	while (!initialised) {
 		if (byteAvailable()) {
@@ -65,6 +90,9 @@ void VDUStreamProcessor::vdu_sys() {
 			}	break;
 			case 0x1B: {					// VDU 23, 27
 				vdu_sys_sprites();			// Sprite system control
+			}	break;
+			case 0x1C: {					// VDU 23, 28
+				vdu_sys_hexload();
 			}	break;
 		}
 	}
@@ -116,6 +144,15 @@ void VDUStreamProcessor::vdu_sys_video() {
 		case VDP_KEYSTATE: {			// VDU 23, 0, &88, repeatRate; repeatDelay; status
 			vdu_sys_keystate();
 		}	break;
+		case VDP_MOUSE: {				// VDU 23, 0, &89, command, <args>
+			vdu_sys_mouse();
+		}	break;
+		case VDP_BUFFERED: {			// VDU 23, 0, &A0, bufferId; command, <args>
+			vdu_sys_buffered();
+		}	break;
+		case VDP_UPDATER: {				// VDU 23, 0, &A1, command, <args>
+			vdu_sys_updater();
+		}	break;
 		case VDP_LOGICALCOORDS: {		// VDU 23, 0, &C0, n
 			auto b = readByte_t();		// Set logical coord mode
 			if (b >= 0) {
@@ -131,6 +168,10 @@ void VDUStreamProcessor::vdu_sys_video() {
 		case VDP_SWITCHBUFFER: {		// VDU 23, 0, &C3
 			switchBuffer();
 		}	break;
+		case VDP_CONSOLEMODE: {			// VDU 23, 0, &FE, n
+			auto b = readByte_t();
+			setConsoleMode((bool) b);
+		}	break;
 		case VDP_TERMINALMODE: {		// VDU 23, 0, &FF
 			switchTerminalMode(); 		// Switch to terminal mode
 		}	break;
@@ -140,9 +181,13 @@ void VDUStreamProcessor::vdu_sys_video() {
 // VDU 23, 0, &80, <echo>: Send a general poll/echo byte back to MOS
 //
 void VDUStreamProcessor::sendGeneralPoll() {
-	auto b = readByte_b();
+	auto b = readByte_t();
+	if (b == -1) {
+		debug_log("sendGeneralPoll: Timeout\n\r");
+		return;
+	}
 	uint8_t packet[] = {
-		b,
+		(uint8_t) (b & 0xFF),
 	};
 	send_packet(PACKET_GP, sizeof packet, packet);
 	initialised = true;	
@@ -159,8 +204,8 @@ void VDUStreamProcessor::vdu_sys_video_kblayout() {
 //
 void VDUStreamProcessor::sendCursorPosition() {
 	uint8_t packet[] = {
-		textCursor.X / fontW,
-		textCursor.Y / fontH,
+		(uint8_t) ((textCursor.X - textViewport.X1)/ fontW),
+		(uint8_t) ((textCursor.Y - textViewport.Y1)/ fontH),
 	};
 	send_packet(PACKET_CURSOR, sizeof packet, packet);	
 }
@@ -168,6 +213,7 @@ void VDUStreamProcessor::sendCursorPosition() {
 // VDU 23, 0, &83 Send a character back to MOS
 //
 void VDUStreamProcessor::sendScreenChar(uint16_t x, uint16_t y) {
+	waitPlotCompletion();
 	uint16_t px = x * fontW;
 	uint16_t py = y * fontH;
 	char c = getScreenChar(px, py);
@@ -180,6 +226,7 @@ void VDUStreamProcessor::sendScreenChar(uint16_t x, uint16_t y) {
 // VDU 23, 0, &84: Send a pixel value back to MOS
 //
 void VDUStreamProcessor::sendScreenPixel(uint16_t x, uint16_t y) {
+	waitPlotCompletion();
 	RGB888 pixel = getPixel(x, y);
 	uint8_t pixelIndex = getPaletteIndex(pixel);
 	uint8_t packet[] = {
@@ -194,29 +241,30 @@ void VDUStreamProcessor::sendScreenPixel(uint16_t x, uint16_t y) {
 // VDU 23, 0, &87, 0: Send TIME information (from ESP32 RTC)
 //
 void VDUStreamProcessor::sendTime() {
-	uint8_t packet[] = {
-		rtc.getYear() - EPOCH_YEAR,			// 0 - 255
-		rtc.getMonth(),						// 0 - 11
-		rtc.getDay(),						// 1 - 31
-		rtc.getDayofYear(),					// 0 - 365
-		rtc.getDayofWeek(),					// 0 - 6
-		rtc.getHour(true),					// 0 - 23
-		rtc.getMinute(),					// 0 - 59
-		rtc.getSecond(),					// 0 - 59
-	};
-	send_packet(PACKET_RTC, sizeof packet, packet);
+	vdp_time_t	time;
+
+	time.year = rtc.getYear() - EPOCH_YEAR;	// 0 - 255
+	time.month = rtc.getMonth();			// 0 - 11
+	time.day = rtc.getDay();				// 1 - 31
+	time.dayOfYear = rtc.getDayofYear();	// 0 - 365
+	time.dayOfWeek = rtc.getDayofWeek();	// 0 - 6
+	time.hour = rtc.getHour(true);			// 0 - 23
+	time.minute = rtc.getMinute();			// 0 - 59
+	time.second = rtc.getSecond();			// 0 - 59
+
+	send_packet(PACKET_RTC, sizeof time.packet, time.packet);
 }
 
 // VDU 23, 0, &86: Send MODE information (screen details)
 //
 void VDUStreamProcessor::sendModeInformation() {
 	uint8_t packet[] = {
-		canvasW & 0xFF,						// Width in pixels (L)
-		(canvasW >> 8) & 0xFF,				// Width in pixels (H)
-		canvasH & 0xFF,						// Height in pixels (L)
-		(canvasH >> 8) & 0xFF,				// Height in pixels (H)
-		canvasW / fontW,					// Width in characters (byte)
-		canvasH / fontH,					// Height in characters (byte)
+		(uint8_t) (canvasW & 0xFF),			// Width in pixels (L)
+		(uint8_t) ((canvasW >> 8) & 0xFF),	// Width in pixels (H)
+		(uint8_t) (canvasH & 0xFF),			// Height in pixels (L)
+		(uint8_t) ((canvasH >> 8) & 0xFF),	// Height in pixels (H)
+		(uint8_t) (canvasW / fontW),		// Width in characters (byte)
+		(uint8_t) (canvasH / fontH),		// Height in characters (byte)
 		getVGAColourDepth(),				// Colour depth
 		videoMode,							// The video mode number
 	};
@@ -255,10 +303,10 @@ void VDUStreamProcessor::sendKeyboardState() {
 	uint8_t		ledState;
 	getKeyboardState(&delay, &rate, &ledState);
 	uint8_t		packet[] = {
-		delay & 0xFF,
-		(delay >> 8) & 0xFF,
-		rate & 0xFF,
-		(rate >> 8) & 0xFF,
+		(uint8_t) (delay & 0xFF),
+		(uint8_t) ((delay >> 8) & 0xFF),
+		(uint8_t) (rate & 0xFF),
+		(uint8_t) ((rate >> 8) & 0xFF),
 		ledState
 	};
 	send_packet(PACKET_KEYSTATE, sizeof packet, packet);
@@ -275,6 +323,136 @@ void VDUStreamProcessor::vdu_sys_keystate() {
 	setKeyboardState(delay, rate, ledState);
 	debug_log("vdu_sys_video: keystate: delay=%d, rate=%d, led=%d\n\r", kbRepeatDelay, kbRepeatRate, ledState);
 	sendKeyboardState();
+}
+
+// VDU 23, 0, &89, command, [<args>]: Handle mouse requests
+//
+void VDUStreamProcessor::vdu_sys_mouse() {
+	auto command = readByte_t(); if (command == -1) return;
+
+	switch (command) {
+		case MOUSE_ENABLE: {
+			// ensure mouse is enabled, enabling its port if necessary
+			if (enableMouse()) {
+				// mouse can be enabled, so set cursor
+				if (!setMouseCursor()) {
+					uint16_t cursor = MOUSE_DEFAULT_CURSOR;
+					setMouseCursor(cursor);
+				}
+				debug_log("vdu_sys_mouse: mouse enabled\n\r");
+			} else {
+				debug_log("vdu_sys_mouse: mouse enable failed\n\r");
+			}
+			// send mouse data (with no delta) to indicate command processed successfully
+			sendMouseData();
+		}	break;
+
+		case MOUSE_DISABLE: {
+			if (disableMouse()) {
+				setMouseCursor(65535);	// set cursor to be a non-existant cursor
+				debug_log("vdu_sys_mouse: mouse disabled\n\r");
+			} else {
+				debug_log("vdu_sys_mouse: mouse disable failed\n\r");
+			}
+			sendMouseData();
+		}	break;
+
+		case MOUSE_RESET: {
+			debug_log("vdu_sys_mouse: reset mouse\n\r");
+			// call the reset for the mouse
+			if (resetMouse()) {
+				// mouse successfully reset, so set cursor
+				if (!setMouseCursor()) {
+					uint16_t cursor = MOUSE_DEFAULT_CURSOR;
+					setMouseCursor(cursor);
+				}
+			}
+			sendMouseData();
+		}	break;
+
+		case MOUSE_SET_CURSOR: {
+			auto cursor = readWord_t();	if (cursor == -1) return;
+			if (setMouseCursor(cursor)) {
+				sendMouseData();
+			}
+			debug_log("vdu_sys_mouse: set cursor\n\r");
+		}	break;
+
+		case MOUSE_SET_POSITION: {
+			auto x = readWord_t();	if (x == -1) return;
+			auto y = readWord_t();	if (y == -1) return;
+			// normalise coordinates
+			auto p = translateCanvas(scale(x, y));
+
+			// need to update position in mouse status
+			setMousePos(p.X, p.Y);
+			setMouseCursorPos(p.X, p.Y);
+
+			sendMouseData();
+			debug_log("vdu_sys_mouse: set position\n\r");
+		}	break;
+
+		case MOUSE_SET_AREA: {
+			auto x = readWord_t();	if (x == -1) return;
+			auto y = readWord_t();	if (y == -1) return;
+			auto x2 = readWord_t();	if (x2 == -1) return;
+			auto y2 = readWord_t();	if (y2 == -1) return;
+
+			debug_log("vdu_sys_mouse: set area can't be properly supported with current fab-gl\n\r");
+			// TODO set area to width/height using bottom/right only
+		}	break;
+
+		case MOUSE_SET_SAMPLERATE: {
+			auto rate = readByte_t();	if (rate == -1) return;
+			if (setMouseSampleRate(rate)) {
+				debug_log("vdu_sys_mouse: set sample rate %d\n\r", rate);
+				// success so send new data packet (triggering VDP flag)
+				sendMouseData();
+			}
+			debug_log("vdu_sys_mouse: set sample rate %d failed\n\r", rate);
+		}	break;
+
+		case MOUSE_SET_RESOLUTION: {
+			auto resolution = readByte_t();	if (resolution == -1) return;
+			if (setMouseResolution(resolution)) {
+				// success so send new data packet (triggering VDP flag)
+				sendMouseData();
+				debug_log("vdu_sys_mouse: set resolution %d\n\r", resolution);
+				return;
+			}
+			debug_log("vdu_sys_mouse: set resolution %d failed\n\r", resolution);
+		}	break;
+
+		case MOUSE_SET_SCALING: {
+			auto scaling = readByte_t();	if (scaling == -1) return;
+			if (setMouseScaling(scaling)) {
+				// success so send new data packet (triggering VDP flag)
+				sendMouseData();
+				debug_log("vdu_sys_mouse: set scaling %d\n\r", scaling);
+				return;
+			}
+		}	break;
+
+		case MOUSE_SET_ACCERATION: {
+			auto acceleration = readWord_t();	if (acceleration == -1) return;
+			if (setMouseAcceleration(acceleration)) {
+				// success so send new data packet (triggering VDP flag)
+				sendMouseData();
+				debug_log("vdu_sys_mouse: set acceleration %d\n\r", acceleration);
+				return;
+			}
+		}	break;
+
+		case MOUSE_SET_WHEELACC: {
+			auto wheelAcc = read24_t();	if (wheelAcc == -1) return;
+			if (setMouseWheelAcceleration(wheelAcc)) {
+				// success so send new data packet (triggering VDP flag)
+				sendMouseData();
+				debug_log("vdu_sys_mouse: set wheel acceleration %d\n\r", wheelAcc);
+				return;
+			}
+		}	break;
+	}
 }
 
 // VDU 23,7: Scroll rectangle on screen
